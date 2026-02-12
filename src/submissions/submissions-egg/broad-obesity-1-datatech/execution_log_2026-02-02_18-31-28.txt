@@ -1,0 +1,108 @@
+========================================
+STARTING LOCAL TEST EXECUTION
+========================================
+================================================================================
+Training Perturbmean Baseline
+================================================================================
+Loading training data (backed mode)...
+Data shape: (88202, 21592)
+Loaded proportion data: 123 perturbations
+
+Extracting Control (NC) data...
+NC cells: 8705
+Control mean shape: (21592,)
+
+Computing average Delta from all perturbations...
+Total perturbations: 122
+
+Average Delta computed:
+  Shape: (21592,)
+  Mean: -0.001187
+  Std: 0.011975
+  Min: -0.123661
+  Max: 0.140029
+
+Computing average cell proportions...
+Average proportions from file:
+  pre_adipo: 0.3780
+  adipo: 0.2702
+  lipo: 0.0792
+  other: 0.3518
+
+Normalized proportions:
+  pre_adipo: 0.3780
+  adipo: 0.2702
+  lipo: 0.0792
+  other: 0.3518
+  Sum (pre_adipo + adipo + other): 1.0000
+  lipo <= adipo: True
+
+Saved average_delta.pkl
+Saved average_proportions.pkl
+Saved control_mean.pkl
+Saved nc_indices.pkl
+
+================================================================================
+Training completed!
+================================================================================
+
+>>> Phase 2: Preparing for inference...
+Loading local ground truth from /home/mutianhong/work/crunch-broad/CrunchDAO-obesity/src/submissions/submissions-egg/broad-obesity-1-datatech/data/obesity_challenge_1_local_gtruth.h5ad
+Perturbations to predict (from local gtruth): ['CHD4', 'FOXC1', 'SOX6', 'TRIM5', 'ZBTB20']
+
+>>> Phase 3: Running infer()...
+================================================================================
+Perturbmean Baseline Inference
+================================================================================
+Predictions to generate: 5
+Genes to predict: 10238
+Cells per perturbation: 100
+
+Loading model data...
+Average delta shape: (21592,)
+Average proportions: [0.37800723 0.27020159 0.07922398 0.35179118]
+
+Loading NC cells from training data...
+Reading NC expression data (target genes only)...
+NC cells shape: (8705, 10238)
+Control mean (subset) shape: (10238,)
+Average delta (subset) shape: (10238,)
+
+Sampling 100 NC cells with mean matching...
+Sampled mean difference from control mean: 7.117880
+Relative difference: 0.040388
+
+Generating predictions:
+  Total cells: 500
+  Total genes: 10238
+Using HDF5 low-memory mode...
+Finished writing prediction matrix to HDF5.
+Creating AnnData object from HDF5...
+Saving prediction to h5ad file...
+Cleaned up temporary HDF5 file.
+
+================================================================================
+Inference completed!
+================================================================================
+
+========================================
+LOCAL TEST COMPLETED SUCCESSFULLY
+Check outputs in: /home/mutianhong/work/crunch-broad/CrunchDAO-obesity/src/submissions/submissions-egg/broad-obesity-1-datatech/prediction
+========================================
+
+>>> Phase 4: Running evaluation...
+
+==================================================
+STARTING EVALUATION
+==================================================
+Loading prediction data...
+Loading ground truth data...
+Loading ground truth proportions...
+Loading training data for perturbed centroid...
+Number of perturbations to evaluate: 5
+Randomly selecting 1000 genes out of 10238
+Using 1000 genes for transcriptome-wide metrics
+Computing perturbed centroid from training data...
+Perturbed centroid computed from 79497 cells
+
+Computing transcriptome-wide metrics...

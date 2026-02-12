@@ -2,3 +2,5 @@ data/
 eda/
 tmp/
 *.csv
+*.pkl
+*.h5ad
