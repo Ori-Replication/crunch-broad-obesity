@@ -1,6 +1,6 @@
 # Method Description
 
-This method employs **Flow Matching** (PM+Flow_pc5_a0.10) to predict gene perturbation effects in adipocyte precursor cells, using only the competition training data without external datasets.
+This method employs **Flow Matching** (PM+FlowImp_ode100_pc5_a0.11) to predict gene perturbation effects in adipocyte precursor cells, using only the competition training data without external datasets.
 
 ## Core Approach: Flow Matching Combination
 
@@ -12,7 +12,7 @@ This method employs **Flow Matching** (PM+Flow_pc5_a0.10) to predict gene pertur
 
 3. **Flow matching**: Learn a conditional velocity field v_theta(x_t, t, c) that transports from standard Gaussian N(0,I) to perturbation PC scores, conditioned on gene loadings c. The model learns p(perturbation effect | gene identity) in the latent PCA space.
 
-4. **Combination strategy**: `(1-alpha)*PerturbMean + alpha*FlowMatch` with alpha=0.10. Pure flow matching tends to overfit with ~122 training samples; blending with the robust PerturbMean baseline balances variance and improves generalization.
+4. **Combination strategy**: `(1-alpha)*PerturbMean + alpha*FlowMatch` with alpha=0.11. Pure flow matching tends to overfit with ~122 training samples; blending with the robust PerturbMean baseline balances variance. ODE integration uses 100 steps (vs 50) for improved accuracy.
 
 5. **Prediction**: For each of the 2863 target perturbations (gene names), use the gene's PCA loadings as condition, integrate the learned ODE from x_0~N(0,I) to obtain predicted PC scores, decode to delta space, and blend with PerturbMean. For genes not in the loadings matrix, fall back to PerturbMean.
 
@@ -20,7 +20,7 @@ This method employs **Flow Matching** (PM+Flow_pc5_a0.10) to predict gene pertur
 
 ## Rationale
 
-Flow matching models the conditional distribution of perturbation effects given gene identity in a low-dimensional PCA space. By learning a generative model in latent space, we capture non-linear structure that linear regression may miss. The PM+Flow combination (alpha=0.10) was selected via 5-fold cross-validation as the best trade-off, achieving Pearson 0.2289 vs 0.2215 for PerturbMean (+3.4%), and 0.2263 for PCA-Ridge regression.
+Flow matching models the conditional distribution of perturbation effects given gene identity in a low-dimensional PCA space. The PM+FlowImp variant (alpha=0.11, n_ode_steps=100) was selected via 5-fold cross-validation from improvement experiments, achieving Pearson 0.2301 vs 0.2215 for PerturbMean (+3.9%), outperforming the previous best PM+Flow_pc5_a0.10 (0.2289).
 
 ## Data and Resources Used
 

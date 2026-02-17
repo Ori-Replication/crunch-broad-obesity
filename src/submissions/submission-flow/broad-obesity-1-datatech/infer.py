@@ -4,12 +4,11 @@
 - 计算相对于 NC 的 Delta
 - 从 NC 中采样 100 个细胞（均值匹配）
 - 对每个扰动的采样细胞加上 Delta 得到预测
-- 使用平均细胞比例
+- 细胞比例：使用 Gene2vec KNN 预测器（ProportionKNNPredictor），
+  找不到 Embedding 的基因用全 0 向量表示；若无预测器则回退到平均比例
 
-预测表由 prepare_resources.py 使用 PM+Flow_pc5_a0.10（Flow Matching）方法生成：
-- 流匹配：(1-α)*PerturbMean + α*FlowMatch，α=0.10
-- 纯 PCA 流匹配学习 p(扰动 PC scores | 基因 PC loadings)
-- 仅使用竞赛训练数据，无外部数据
+预测表由 prepare_resources.py 使用 PM+FlowImp_ode100_pc5_a0.11 生成：
+- 流匹配 (1-α)*PerturbMean + α*FlowMatch，α=0.11，ODE 100 步
 """
 
 import os
@@ -105,7 +104,16 @@ def infer(
     average_proportions = joblib.load(os.path.join(model_directory_path, "average_proportions.pkl"))
     control_mean = joblib.load(os.path.join(model_directory_path, "control_mean.pkl"))
     nc_indices = joblib.load(os.path.join(model_directory_path, "nc_indices.pkl"))
-    print(f"Average proportions: {average_proportions}")
+
+    # 尝试加载 Gene2vec KNN 细胞比例预测器（找不到 Embedding 的基因用全 0 表示）
+    proportion_predictor = None
+    gene2vec_path = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
+    predictor_path = os.path.join(model_directory_path, "proportion_knn_predictor.pkl")
+    if os.path.exists(predictor_path) and os.path.exists(gene2vec_path):
+        proportion_predictor = joblib.load(predictor_path)
+        print(f"Using ProportionKNNPredictor for cell proportions")
+    else:
+        print(f"Using average proportions (fallback)")
 
     # 4. 加载训练数据并准备 NC 细胞
     print("\nLoading NC cells from training data...")
@@ -144,6 +152,13 @@ def infer(
     print("\nExtracting perturbation means and computing Deltas...")
     pred_gene_idx_map = {g: i for i, g in enumerate(pred_table.var_names)}
     pred_target_indices = [pred_gene_idx_map[g] for g in genes_to_predict]
+
+    # 预计算每个扰动的细胞比例（使用 ProportionKNNPredictor 或平均比例）
+    if proportion_predictor is not None:
+        prop_pred_df = proportion_predictor.predict(predict_perturbations, gene2vec_path)
+        prop_by_pert = {row["gene"]: row[["pre_adipo", "adipo", "lipo", "other"]].values for _, row in prop_pred_df.iterrows()}
+    else:
+        prop_by_pert = {p: average_proportions.copy() for p in predict_perturbations}
 
     perturbation_deltas = {}
     for pert in tqdm(predict_perturbations, desc="Computing Deltas"):
@@ -224,7 +239,7 @@ def infer(
             dset[start_idx:end_idx] = pert_cells
 
             obs_genes.extend([pert] * cells_per_perturbation)
-            prop_preds.append(average_proportions.copy())
+            prop_preds.append(prop_by_pert[pert].copy())
 
             if i % 1000 == 0:
                 gc.collect()

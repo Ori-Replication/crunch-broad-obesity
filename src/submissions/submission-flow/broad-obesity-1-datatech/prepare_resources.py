@@ -1,12 +1,11 @@
 """
-预计算脚本：使用 PM+Flow_pc5_a0.10（Flow Matching）方法生成预测表
+预计算脚本：使用 PM+FlowImp_ode100_pc5_a0.11（Flow Matching 改进版）生成预测表
 本脚本在本地运行，生成 resources/ 中的所有文件
 
-方法：流匹配组合 (1-α)*PerturbMean + α*FlowMatch，α=0.10
+方法：流匹配组合 (1-α)*PerturbMean + α*FlowMatch，α=0.11
 - 纯 PCA 流匹配：在 delta 空间学习 p(扰动 PC scores | 基因 PC loadings)
-- 条件：基因的 PCA 载荷（来自 genes × train_perts 矩阵的 PCA）
-- 目标：扰动的 PC 分数（来自 train_perts × genes 矩阵的 PCA）
-- 组合：与 PerturbMean 混合缓解过拟合，α=0.10 在 5 折 CV 中最佳
+- 改进：ODE 积分步数 100（原 50），α=0.11（原 0.10）
+- 5 折 CV 最佳：Pearson 0.2301 vs PerturbMean 0.2215 (+3.9%)
 
 运行方式：
     cd CrunchDAO-obesity
@@ -32,6 +31,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "original_data" / "default"
 RESOURCES_DIR = SCRIPT_DIR / "resources"
+GENE2VEC_SRC = PROJECT_ROOT / "external_repos" / "Gene2vec" / "pre_trained_emb" / "gene2vec_dim_200_iter_9_w2v.txt"
 
 RESOURCES_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -82,8 +82,10 @@ class FlowMatchingPCA:
         device: str = "cpu",
         n_samples: int = 10,
         deterministic: bool = False,
+        n_ode_steps: int = 100,
     ):
         self.n_components = n_components
+        self.n_ode_steps = n_ode_steps
         self.hidden = hidden
         self.n_layers = n_layers
         self.lr = lr
@@ -186,11 +188,10 @@ class FlowMatchingPCA:
                     else torch.randn(1, self.n_components, device=self.device)
                 )
                 c_batch = c.unsqueeze(0).expand(1, -1)
-                n_steps = 50
-                for k in range(n_steps):
-                    t = torch.tensor([k / n_steps], device=self.device)
+                for k in range(self.n_ode_steps):
+                    t = torch.tensor([k / self.n_ode_steps], device=self.device)
                     v = self.model(x, t, c_batch)
-                    x = x + v / n_steps
+                    x = x + v / self.n_ode_steps
                 x_np = x.cpu().numpy().flatten()
                 scores = x_np * self.target_std + self.target_mean
                 delta_pc = self.pca_perts.inverse_transform(
@@ -202,7 +203,7 @@ class FlowMatchingPCA:
 
 def main():
     print("=" * 80)
-    print("Prepare Resources: PM+Flow_pc5_a0.10 (Flow Matching) Method")
+    print("Prepare Resources: PM+FlowImp_ode100_pc5_a0.11 (Flow Matching) Method")
     print("=" * 80, flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -259,9 +260,9 @@ def main():
     )
 
     # ============================================
-    # 2. 训练 PM+Flow_pc5_a0.10
+    # 2. 训练 PM+FlowImp_ode100_pc5_a0.11（改进版：ODE 100 步，α=0.11）
     # ============================================
-    print("\n[2] Training PM+Flow_pc5_a0.10 (PerturbMean + FlowMatch, α=0.10)...", flush=True)
+    print("\n[2] Training PM+FlowImp_ode100_pc5_a0.11 (PerturbMean + FlowMatch, α=0.11, n_ode=100)...", flush=True)
 
     pm_delta = average_delta.copy()
     flow = FlowMatchingPCA(
@@ -272,10 +273,11 @@ def main():
         batch_size=min(32, len(train_perts) - 1),
         device=device,
         n_samples=10,
+        n_ode_steps=100,
     )
     flow.fit(train_deltas_np, train_perts, gene_names=gene_names)
-    alpha = 0.10
-    print(f"  Flow matching trained. Using α={alpha}", flush=True)
+    alpha = 0.11
+    print(f"  Flow matching trained. Using α={alpha}, n_ode_steps=100", flush=True)
 
     # ============================================
     # 3. 生成预测表
@@ -312,6 +314,16 @@ def main():
     # 4. 保存其他资源
     # ============================================
     print("\n[4] Saving resources...", flush=True)
+
+    # 复制 Gene2vec 到 resources，供 ProportionKNNPredictor 使用
+    if GENE2VEC_SRC.exists():
+        import shutil
+
+        gene2vec_dst = RESOURCES_DIR / "gene2vec_dim_200_iter_9_w2v.txt"
+        shutil.copy2(GENE2VEC_SRC, gene2vec_dst)
+        print(f"  Copied Gene2vec to: {gene2vec_dst}", flush=True)
+    else:
+        print(f"  Warning: Gene2vec not found at {GENE2VEC_SRC}", flush=True)
 
     joblib.dump(average_delta, RESOURCES_DIR / "average_delta.pkl")
     joblib.dump(avg_prop, RESOURCES_DIR / "average_proportions.pkl")

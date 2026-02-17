@@ -4,17 +4,21 @@
 - 计算平均细胞比例
 - 保存 NC 细胞索引（用于推理时采样）
 
-注意：prediction_table_fp16_compressed.h5ad 已由 prepare_resources.py
-预计算并保存在 resources/ 中，使用 PM+Flow_pc5_a0.10（Flow Matching）方法。
+注意：prediction_table_fp16_compressed.h5ad 由 prepare_resources.py 预计算，
+使用 PM+FlowImp_ode100_pc5_a0.11（α=0.11，ODE 100 步）。
 """
 
 import os
 import gc
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import joblib
 from tqdm import tqdm
+
+from proportion_knn_predictor import ProportionKNNPredictor
 
 
 def train(
@@ -91,7 +95,39 @@ def train(
     print(f"  pre_adipo: {avg_prop[0]:.4f}, adipo: {avg_prop[1]:.4f}")
     print(f"  lipo: {avg_prop[2]:.4f}, other: {avg_prop[3]:.4f}")
 
-    # 3. 保存
+    # 3. 拟合 Gene2vec KNN 细胞比例预测器
+    gene2vec_path = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
+    script_dir = Path(__file__).resolve().parent
+    if not os.path.exists(gene2vec_path):
+        # 本地开发时可能 Gene2vec 在 external_repos
+        fallback = script_dir.parent.parent.parent.parent / "external_repos" / "Gene2vec" / "pre_trained_emb" / "gene2vec_dim_200_iter_9_w2v.txt"
+        if fallback.exists():
+            gene2vec_path = str(fallback)
+
+    if df_prop_train is not None and os.path.exists(gene2vec_path):
+        df_prop_no_nc = df_prop_train[df_prop_train["gene"] != "NC"]
+        train_genes = df_prop_no_nc["gene"].tolist()
+        if len(train_genes) >= 2:
+            predictor = ProportionKNNPredictor(k=15)
+            predictor.fit(train_genes, df_prop_train, gene2vec_path)
+            joblib.dump(predictor, os.path.join(model_directory_path, "proportion_knn_predictor.pkl"))
+            # 若使用 fallback 路径，复制 Gene2vec 到 model 目录供 infer 使用
+            dst_gene2vec = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
+            if gene2vec_path != dst_gene2vec:
+                import shutil
+
+                shutil.copy2(gene2vec_path, dst_gene2vec)
+                print(f"  Copied Gene2vec to {dst_gene2vec}")
+            print(f"\nFitted ProportionKNNPredictor (K=15) on {len(train_genes)} genes")
+        else:
+            print("\nWarning: Too few train genes for ProportionKNNPredictor, skipping")
+    else:
+        if df_prop_train is None:
+            print("\nWarning: program_proportion.csv not found, skipping ProportionKNNPredictor")
+        else:
+            print(f"\nWarning: Gene2vec not found at {gene2vec_path}, skipping ProportionKNNPredictor")
+
+    # 4. 保存
     os.makedirs(model_directory_path, exist_ok=True)
     joblib.dump(avg_prop, os.path.join(model_directory_path, "average_proportions.pkl"))
     joblib.dump(control_mean, os.path.join(model_directory_path, "control_mean.pkl"))
