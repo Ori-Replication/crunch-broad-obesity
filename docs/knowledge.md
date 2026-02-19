@@ -11,6 +11,7 @@ eda/regression: 基于 regression-baseline 的回归方法探索，结合 xatlas
 eda/flow: 基于 PCA 的流匹配（Flow Matching）生成模型探索，PM+Flow 组合取得 +3.4% 提升
 eda/flow_xatlas: 流匹配 + xatlas 条件，PM+FlowXA 优于 PCA_HEK 但略逊于纯 PM+Flow
 eda/gene2vec: Gene2vec 预训练 embedding 与竞赛基因重合度分析，97.1% 预测目标有 embedding
+eda/scgpt: scGPT Embedding Layer 下载与重合度分析，100% 预测目标有 embedding，优于 Gene2vec
 eda/gene2vec_flow: Gene2vec+Flow 条件扩展 + Ridge 细胞比例预测探索
 eda/MMD: MMD 采样策略探索——除均值外，如何采样以更好地近似整体协方差
 如果代码属于临时性测试脚本，请放在 tmp/ 下

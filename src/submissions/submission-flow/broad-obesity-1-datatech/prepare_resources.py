@@ -1,11 +1,12 @@
 """
-预计算脚本：使用 PM+FlowImp_ode100_pc5_a0.11（Flow Matching 改进版）生成预测表
+预计算脚本：使用 FlowXA_pc10_xpc20（纯 Flow Matching + xatlas）
 本脚本在本地运行，生成 resources/ 中的所有文件
 
-方法：流匹配组合 (1-α)*PerturbMean + α*FlowMatch，α=0.11
-- 纯 PCA 流匹配：在 delta 空间学习 p(扰动 PC scores | 基因 PC loadings)
-- 改进：ODE 积分步数 100（原 50），α=0.11（原 0.10）
-- 5 折 CV 最佳：Pearson 0.2301 vs PerturbMean 0.2215 (+3.9%)
+方法：纯 Flow Matching with xatlas（不组合 PerturbMean）
+- n_components=10: PCA components for competition data
+- n_xatlas_pc=20: PCA components for xatlas HEK293T
+- 条件: [gene_loadings | xatlas_PCA_features]
+- CV 结果: Pearson=0.1767, CosineSim=0.5442 (与 PM 差异大，不过拟合)
 
 运行方式：
     cd CrunchDAO-obesity
@@ -30,6 +31,7 @@ from sklearn.decomposition import PCA
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "original_data" / "default"
+XATLAS_DIR = PROJECT_ROOT / "data" / "external_data" / "xatlas" / "processed"
 RESOURCES_DIR = SCRIPT_DIR / "resources"
 GENE2VEC_SRC = PROJECT_ROOT / "external_repos" / "Gene2vec" / "pre_trained_emb" / "gene2vec_dim_200_iter_9_w2v.txt"
 
@@ -45,7 +47,7 @@ def to_array(x):
 
 
 # =============================================================================
-# Flow Matching Model (from eda/flow)
+# Flow Matching Model with xatlas (from eda/flow_xatlas)
 # =============================================================================
 
 
@@ -68,12 +70,20 @@ class ConditionalVelocityNet(nn.Module):
         return self.net(inp)
 
 
-class FlowMatchingPCA:
-    """纯 PCA 流匹配预测器。"""
+class FlowMatchingPCA_xatlas:
+    """
+    Flow matching conditioned on [gene_loadings | xatlas_PCA_features].
+    纯 Flow，不组合 PerturbMean。
+
+    - gene_loadings: from competition PCA (genes x train_perts)
+    - xatlas_features: PCA on xatlas HEK293T deltas
+    - For genes not in xatlas: xatlas part = zeros
+    """
 
     def __init__(
         self,
         n_components: int = 10,
+        n_xatlas_pc: int = 20,
         hidden: int = 64,
         n_layers: int = 3,
         lr: float = 5e-4,
@@ -81,11 +91,9 @@ class FlowMatchingPCA:
         batch_size: int = 32,
         device: str = "cpu",
         n_samples: int = 10,
-        deterministic: bool = False,
-        n_ode_steps: int = 100,
     ):
         self.n_components = n_components
-        self.n_ode_steps = n_ode_steps
+        self.n_xatlas_pc = n_xatlas_pc
         self.hidden = hidden
         self.n_layers = n_layers
         self.lr = lr
@@ -93,11 +101,12 @@ class FlowMatchingPCA:
         self.batch_size = batch_size
         self.device = device
         self.n_samples = n_samples
-        self.deterministic = deterministic
+        self.xe = None
+        self.xidx = None
         self.fallback = None
         self.ok = False
 
-    def fit(self, td, tp, gene_names=None, **kw):
+    def fit(self, td, tp, gene_names=None, xatlas_df=None, **kw):
         self.gn = gene_names or [f"g{i}" for i in range(td.shape[1])]
         Y = td.T  # (n_genes, n_train_perts)
 
@@ -106,13 +115,37 @@ class FlowMatchingPCA:
             self.fallback = td.mean(axis=0)
             return
 
+        # PCA on genes -> gene loadings
         self.pca_genes = PCA(n_components=n_pc)
         gene_loadings = self.pca_genes.fit_transform(Y)
+        self.gene_loadings_df = pd.DataFrame(gene_loadings, index=self.gn)
 
+        # PCA on perturbations -> target
         self.pca_perts = PCA(n_components=n_pc)
         pert_scores = self.pca_perts.fit_transform(td)
 
-        self.gene_loadings_df = pd.DataFrame(gene_loadings, index=self.gn)
+        # xatlas: PCA on deltas for perturbations in xatlas
+        self.xe = xatlas_df
+        dim_cond = n_pc
+        self.xatlas_pca = None
+        self.xatlas_mean = None
+        self.xatlas_std = None
+        self.xatlas_idx = {}
+
+        if xatlas_df is not None and len(xatlas_df) > 0:
+            xatlas_perts = [p for p in tp if p in xatlas_df.index]
+            if len(xatlas_perts) >= min(5, self.n_xatlas_pc + 2):
+                xf = xatlas_df.loc[xatlas_perts].values.astype(np.float32)
+                nxpc = min(self.n_xatlas_pc, len(xatlas_perts) - 1, xf.shape[1] - 1)
+                if nxpc >= 1:
+                    self.xatlas_pca = PCA(n_components=nxpc)
+                    xatlas_scores = self.xatlas_pca.fit_transform(xf)
+                    self.xatlas_mean = xatlas_scores.mean(axis=0)
+                    self.xatlas_std = xatlas_scores.std(axis=0) + 1e-6
+                    self.xatlas_idx = {p: i for i, p in enumerate(xatlas_perts)}
+                    dim_cond = n_pc + nxpc
+
+        # Build condition: [gene_loadings | xatlas_features]
         train_perts = [p for p in tp if p in self.gene_loadings_df.index]
         if len(train_perts) < n_pc + 2:
             self.fallback = td.mean(axis=0)
@@ -120,7 +153,18 @@ class FlowMatchingPCA:
 
         cond_list, target_list = [], []
         for p in train_perts:
-            c = self.gene_loadings_df.loc[p].values.astype(np.float32)
+            c_gene = self.gene_loadings_df.loc[p].values.astype(np.float32)
+            if self.xatlas_idx is not None and p in self.xatlas_idx:
+                xatlas_raw = self.xatlas_pca.transform(
+                    xatlas_df.loc[p].values.reshape(1, -1)
+                )[0]
+                xatlas_feat = ((xatlas_raw - self.xatlas_mean) / self.xatlas_std).astype(
+                    np.float32
+                )
+                c = np.concatenate([c_gene, xatlas_feat])
+            else:
+                zeros = np.zeros(dim_cond - n_pc, dtype=np.float32)
+                c = np.concatenate([c_gene, zeros])
             idx = tp.index(p)
             y = pert_scores[idx].astype(np.float32)
             cond_list.append(c)
@@ -132,19 +176,20 @@ class FlowMatchingPCA:
         self.cond_mean = cond_arr.mean(axis=0)
         self.cond_std = cond_arr.std(axis=0) + 1e-6
         cond_norm = (cond_arr - self.cond_mean) / self.cond_std
-
         self.target_mean = target_arr.mean(axis=0)
         self.target_std = target_arr.std(axis=0) + 1e-6
         target_norm = (target_arr - self.target_mean) / self.target_std
 
         self.model = ConditionalVelocityNet(
-            dim_x=n_pc, dim_cond=n_pc, hidden=self.hidden, n_layers=self.n_layers
+            dim_x=n_pc,
+            dim_cond=dim_cond,
+            hidden=self.hidden,
+            n_layers=self.n_layers,
         ).to(self.device)
         opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
-
-        n_train = len(cond_list)
         cond_t = torch.from_numpy(cond_norm).float().to(self.device)
         target_t = torch.from_numpy(target_norm).float().to(self.device)
+        n_train = len(cond_list)
 
         self.model.train()
         for ep in range(self.epochs):
@@ -166,9 +211,33 @@ class FlowMatchingPCA:
                 opt.step()
 
         self.fallback = td.mean(axis=0)
+        self.dim_cond = dim_cond
+        self.n_xatlas_pc_act = dim_cond - n_pc if self.xatlas_pca is not None else 0
         self.ok = True
 
-    def predict_single(self, gene_name):
+    def _get_cond(self, p, xatlas_df=None):
+        """Get condition for perturbation p."""
+        if p not in self.gene_loadings_df.index:
+            return None
+        c_gene = self.gene_loadings_df.loc[p].values.astype(np.float32)
+        xe = xatlas_df if xatlas_df is not None else self.xe
+        if self.xatlas_pca is not None and xe is not None and p in xe.index:
+            xatlas_feat = (
+                (
+                    self.xatlas_pca.transform(
+                        xe.loc[p].values.reshape(1, -1)
+                    )[0]
+                    - self.xatlas_mean
+                )
+                / self.xatlas_std
+            )
+            c = np.concatenate([c_gene, xatlas_feat.astype(np.float32)])
+        else:
+            zeros = np.zeros(self.dim_cond - len(c_gene), dtype=np.float32)
+            c = np.concatenate([c_gene, zeros])
+        return (c - self.cond_mean) / self.cond_std
+
+    def predict_single(self, gene_name, xatlas_df=None):
         """预测单个基因扰动的 delta。若基因不在训练载荷中则返回 fallback。"""
         if not self.ok or gene_name not in self.gene_loadings_df.index:
             return self.fallback.copy()
@@ -176,22 +245,19 @@ class FlowMatchingPCA:
         n_genes = len(self.gn)
         self.model.eval()
         with torch.no_grad():
-            c_raw = self.gene_loadings_df.loc[gene_name].values.astype(np.float32)
-            c_norm = (c_raw - self.cond_mean) / self.cond_std
-            c = torch.from_numpy(c_norm).float().to(self.device)
+            c = self._get_cond(gene_name, xatlas_df)
+            if c is None:
+                return self.fallback.copy()
 
+            c_t = torch.from_numpy(c).float().to(self.device)
             preds = []
-            for _ in range(self.n_samples if not self.deterministic else 1):
-                x = (
-                    torch.zeros(1, self.n_components, device=self.device)
-                    if self.deterministic
-                    else torch.randn(1, self.n_components, device=self.device)
-                )
-                c_batch = c.unsqueeze(0).expand(1, -1)
-                for k in range(self.n_ode_steps):
-                    t = torch.tensor([k / self.n_ode_steps], device=self.device)
+            for _ in range(self.n_samples):
+                x = torch.randn(1, self.n_components, device=self.device)
+                c_batch = c_t.unsqueeze(0).expand(1, -1)
+                for k in range(50):
+                    t = torch.tensor([k / 50], device=self.device)
                     v = self.model(x, t, c_batch)
-                    x = x + v / self.n_ode_steps
+                    x = x + v / 50
                 x_np = x.cpu().numpy().flatten()
                 scores = x_np * self.target_std + self.target_mean
                 delta_pc = self.pca_perts.inverse_transform(
@@ -201,10 +267,57 @@ class FlowMatchingPCA:
             return np.mean(preds, axis=0)
 
 
+def agg_xatlas(perts, comp_genes, cell_line="HEK293T"):
+    """Aggregate xatlas deltas."""
+    bd = XATLAS_DIR / "by_batch"
+    bf = sorted(
+        [
+            f
+            for f in os.listdir(bd)
+            if f.startswith(cell_line + "_") and f.endswith("_aggregated.parquet")
+        ]
+    )
+    if not bf:
+        return None
+    fb = pd.read_parquet(bd / bf[0])
+    og = sorted(list(set(comp_genes) & set(fb.columns)))
+    del fb
+    gc.collect()
+    ts = set(perts) | {"Non-Targeting"}
+    ds, dc = {}, {}
+    for fn in tqdm(bf, desc=f"  Agg {cell_line}"):
+        try:
+            b = pd.read_parquet(bd / fn, columns=og)
+            if "Non-Targeting" not in b.index:
+                del b
+                gc.collect()
+                continue
+            ctrl = b.loc["Non-Targeting"].values
+            for p in set(b.index) & ts - {"Non-Targeting"}:
+                d = b.loc[p].values - ctrl
+                if p not in ds:
+                    ds[p] = np.zeros(len(og), dtype=np.float64)
+                    dc[p] = 0
+                ds[p] += d
+                dc[p] += 1
+            del b
+            gc.collect()
+        except Exception:
+            continue
+    avg = {p: ds[p] / dc[p] for p in ds if dc[p] > 0}
+    xd = pd.DataFrame(avg, index=og).T
+    return xd
+
+
 def main():
     print("=" * 80)
-    print("Prepare Resources: PM+FlowImp_ode100_pc5_a0.11 (Flow Matching) Method")
+    print("Prepare Resources: FlowXA_pc10_xpc20 (Pure Flow Matching + xatlas)")
     print("=" * 80, flush=True)
+
+    np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}", flush=True)
@@ -237,8 +350,6 @@ def main():
     train_deltas_np = np.array([train_deltas[p] for p in train_perts])
     print(f"  Valid training perturbations: {len(train_perts)}", flush=True)
 
-    average_delta = train_deltas_np.mean(axis=0)
-
     predict_perts_file = DATA_DIR / "predict_perturbations.txt"
     predict_perturbations = pd.read_csv(predict_perts_file, header=None)[0].tolist()
     print(f"  Prediction targets: {len(predict_perturbations)}", flush=True)
@@ -260,37 +371,43 @@ def main():
     )
 
     # ============================================
-    # 2. 训练 PM+FlowImp_ode100_pc5_a0.11（改进版：ODE 100 步，α=0.11）
+    # 2. 加载 xatlas HEK293T 数据
     # ============================================
-    print("\n[2] Training PM+FlowImp_ode100_pc5_a0.11 (PerturbMean + FlowMatch, α=0.11, n_ode=100)...", flush=True)
+    print("\n[2] Loading xatlas HEK293T data...", flush=True)
+    xatlas_df = agg_xatlas(predict_perturbations, gene_names, cell_line="HEK293T")
+    if xatlas_df is None:
+        raise RuntimeError("Failed to load xatlas HEK293T data")
+    print(f"  xatlas perturbations: {len(xatlas_df)}", flush=True)
 
-    pm_delta = average_delta.copy()
-    flow = FlowMatchingPCA(
-        n_components=5,
+    # ============================================
+    # 3. 训练 FlowXA_pc10_xpc20（纯 Flow，不组合 PM）
+    # ============================================
+    print("\n[3] Training FlowXA_pc10_xpc20 (Pure Flow Matching + xatlas)...", flush=True)
+
+    flow = FlowMatchingPCA_xatlas(
+        n_components=10,
+        n_xatlas_pc=20,
         hidden=64,
         n_layers=3,
         epochs=800,
         batch_size=min(32, len(train_perts) - 1),
         device=device,
         n_samples=10,
-        n_ode_steps=100,
     )
-    flow.fit(train_deltas_np, train_perts, gene_names=gene_names)
-    alpha = 0.11
-    print(f"  Flow matching trained. Using α={alpha}, n_ode_steps=100", flush=True)
+    flow.fit(train_deltas_np, train_perts, gene_names=gene_names, xatlas_df=xatlas_df)
+    print(f"  Flow matching trained. Using pure Flow (no PerturbMean)", flush=True)
 
     # ============================================
-    # 3. 生成预测表
+    # 4. 生成预测表
     # ============================================
-    print("\n[3] Generating prediction table...", flush=True)
+    print("\n[4] Generating prediction table...", flush=True)
 
     prediction_means = {}
     n_flow_pred = 0
     n_fallback = 0
 
     for pert in tqdm(predict_perturbations, desc="  Predicting"):
-        flow_delta = flow.predict_single(pert)
-        delta = (1 - alpha) * pm_delta + alpha * flow_delta
+        delta = flow.predict_single(pert, xatlas_df=xatlas_df)
         prediction_means[pert] = (control_mean + delta).astype(np.float32)
         if flow.ok and pert in flow.gene_loadings_df.index:
             n_flow_pred += 1
@@ -298,7 +415,7 @@ def main():
             n_fallback += 1
 
     print(f"  Flow predictions (gene in loadings): {n_flow_pred}", flush=True)
-    print(f"  Fallback (PerturbMean only): {n_fallback}", flush=True)
+    print(f"  Fallback: {n_fallback}", flush=True)
 
     pred_matrix = np.array([prediction_means[p] for p in predict_perturbations])
     pred_obs = pd.DataFrame({"gene": predict_perturbations})
@@ -311,9 +428,9 @@ def main():
     print(f"  Saved: {pred_path} ({os.path.getsize(pred_path) / 1e6:.1f} MB)", flush=True)
 
     # ============================================
-    # 4. 保存其他资源
+    # 5. 保存其他资源
     # ============================================
-    print("\n[4] Saving resources...", flush=True)
+    print("\n[5] Saving resources...", flush=True)
 
     # 复制 Gene2vec 到 resources，供 ProportionKNNPredictor 使用
     if GENE2VEC_SRC.exists():
@@ -325,6 +442,7 @@ def main():
     else:
         print(f"  Warning: Gene2vec not found at {GENE2VEC_SRC}", flush=True)
 
+    average_delta = train_deltas_np.mean(axis=0)
     joblib.dump(average_delta, RESOURCES_DIR / "average_delta.pkl")
     joblib.dump(avg_prop, RESOURCES_DIR / "average_proportions.pkl")
     joblib.dump(control_mean, RESOURCES_DIR / "control_mean.pkl")
@@ -336,9 +454,9 @@ def main():
     )
 
     # ============================================
-    # 5. 验证
+    # 6. 验证
     # ============================================
-    print("\n[5] Validation...", flush=True)
+    print("\n[6] Validation...", flush=True)
     pred_check = sc.read_h5ad(pred_path)
     print(f"  Prediction table shape: {pred_check.shape}", flush=True)
     print(f"  Perturbations: {len(pred_check.obs['gene'].unique())}", flush=True)
@@ -350,6 +468,8 @@ def main():
 
     print("\n" + "=" * 80)
     print("Resources prepared successfully!")
+    print("Method: FlowXA_pc10_xpc20 (Pure Flow + xatlas)")
+    print("CV: Pearson=0.1767, CosineSim=0.5442")
     print("=" * 80, flush=True)
 
 
