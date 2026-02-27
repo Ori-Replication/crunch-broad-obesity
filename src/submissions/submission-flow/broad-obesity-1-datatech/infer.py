@@ -4,7 +4,7 @@
 - 计算相对于 NC 的 Delta
 - 从 NC 中采样 100 个细胞（均值匹配）
 - 对每个扰动的采样细胞加上 Delta 得到预测
-- 细胞比例：使用 Gene2vec KNN 预测器（ProportionKNNPredictor），
+- 细胞比例：使用 ProportionKNNPredictor（scGPT 优先，Gene2vec 回退，均带 PCA），
   找不到 Embedding 的基因用全 0 向量表示；若无预测器则回退到平均比例
 
 预测表由 prepare_resources.py 使用 PM+FlowImp_ode100_pc5_a0.11 生成：
@@ -105,14 +105,20 @@ def infer(
     control_mean = joblib.load(os.path.join(model_directory_path, "control_mean.pkl"))
     nc_indices = joblib.load(os.path.join(model_directory_path, "nc_indices.pkl"))
 
-    # 尝试加载 Gene2vec KNN 细胞比例预测器（找不到 Embedding 的基因用全 0 表示）
+    # 加载细胞比例预测器（仅用 resources 中预提取的紧凑 pkl，不加载大文件）
     proportion_predictor = None
-    gene2vec_path = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
+    proportion_emb = None
     predictor_path = os.path.join(model_directory_path, "proportion_knn_predictor.pkl")
-    if os.path.exists(predictor_path) and os.path.exists(gene2vec_path):
+    if os.path.exists(predictor_path):
         proportion_predictor = joblib.load(predictor_path)
-        print(f"Using ProportionKNNPredictor for cell proportions")
-    else:
+        src = getattr(proportion_predictor, "embedding_source", "gene2vec")
+        emb_path = os.path.join(model_directory_path, f"{src}_embeddings.pkl")
+        if os.path.exists(emb_path):
+            proportion_emb = joblib.load(emb_path)
+            print(f"Using ProportionKNNPredictor ({src}) for cell proportions")
+        else:
+            proportion_predictor = None
+    if proportion_predictor is None:
         print(f"Using average proportions (fallback)")
 
     # 4. 加载训练数据并准备 NC 细胞
@@ -154,8 +160,8 @@ def infer(
     pred_target_indices = [pred_gene_idx_map[g] for g in genes_to_predict]
 
     # 预计算每个扰动的细胞比例（使用 ProportionKNNPredictor 或平均比例）
-    if proportion_predictor is not None:
-        prop_pred_df = proportion_predictor.predict(predict_perturbations, gene2vec_path)
+    if proportion_predictor is not None and proportion_emb is not None:
+        prop_pred_df = proportion_predictor.predict(predict_perturbations, proportion_emb)
         prop_by_pert = {row["gene"]: row[["pre_adipo", "adipo", "lipo", "other"]].values for _, row in prop_pred_df.iterrows()}
     else:
         prop_by_pert = {p: average_proportions.copy() for p in predict_perturbations}

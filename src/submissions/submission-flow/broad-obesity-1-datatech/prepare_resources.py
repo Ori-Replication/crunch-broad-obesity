@@ -32,6 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "original_data" / "default"
 XATLAS_DIR = PROJECT_ROOT / "data" / "external_data" / "xatlas" / "processed"
+GSE217812_DIR = PROJECT_ROOT / "data" / "external_data" / "GSE217812" / "processed"
 RESOURCES_DIR = SCRIPT_DIR / "resources"
 GENE2VEC_SRC = PROJECT_ROOT / "external_repos" / "Gene2vec" / "pre_trained_emb" / "gene2vec_dim_200_iter_9_w2v.txt"
 
@@ -350,6 +351,31 @@ def main():
     train_deltas_np = np.array([train_deltas[p] for p in train_perts])
     print(f"  Valid training perturbations: {len(train_perts)}", flush=True)
 
+    # 可选：GSE217812 脂肪细胞池化 delta 增强 PCA 空间
+    use_gse217812 = False
+    gse217812_path = GSE217812_DIR / "gse217812_pooled_delta.parquet"
+    if gse217812_path.exists():
+        print("\n[1b] Loading GSE217812 adipocyte pooled delta...", flush=True)
+        gse_df = pd.read_parquet(gse217812_path)
+        # 对齐到竞赛基因
+        overlap = [g for g in gene_names if g in gse_df.columns]
+        if len(overlap) >= 1000:
+            pooled_delta = np.zeros(n_genes, dtype=np.float64)
+            for i, g in enumerate(gene_names):
+                if g in gse_df.columns:
+                    pooled_delta[i] = gse_df.loc["pooled_adipocyte", g]
+            # 归一化到与 train_deltas 相近的尺度，作为额外行参与 PCA
+            scale = np.std(train_deltas_np) / (np.std(pooled_delta) + 1e-8)
+            pooled_delta = pooled_delta * min(scale, 2.0)
+            train_deltas_np = np.vstack([train_deltas_np, pooled_delta.reshape(1, -1)])
+            train_perts = train_perts + ["pooled_adipocyte"]  # 保持 td/tp 长度一致，Flow 训练时会过滤
+            use_gse217812 = True
+            print(f"  GSE217812: {len(overlap)} genes, augmented PCA with adipocyte prior", flush=True)
+        else:
+            print(f"  GSE217812: too few overlapping genes ({len(overlap)}), skipping", flush=True)
+    else:
+        print(f"\n  (GSE217812 not found at {gse217812_path}, run eda/GSE217812/process_gse217812.py first)", flush=True)
+
     predict_perts_file = DATA_DIR / "predict_perturbations.txt"
     predict_perturbations = pd.read_csv(predict_perts_file, header=None)[0].tolist()
     print(f"  Prediction targets: {len(predict_perturbations)}", flush=True)
@@ -432,13 +458,68 @@ def main():
     # ============================================
     print("\n[5] Saving resources...", flush=True)
 
-    # 复制 Gene2vec 到 resources，供 ProportionKNNPredictor 使用
-    if GENE2VEC_SRC.exists():
-        import shutil
+    # 提取 scGPT 嵌入供 ProportionKNNPredictor 使用（实验结论：scGPT+PCA32+K15 最优）
+    all_pert_genes = list(dict.fromkeys(predict_perturbations + train_perts))
+    SCGPT_DIR = PROJECT_ROOT / "data" / "external_model" / "scgpt"
+    scgpt_model_path = SCGPT_DIR / "model.safetensors"
+    scgpt_vocab_path = SCGPT_DIR / "vocab.json"
+    if scgpt_model_path.exists() and scgpt_vocab_path.exists():
+        try:
+            import json
+            from safetensors import safe_open
 
-        gene2vec_dst = RESOURCES_DIR / "gene2vec_dim_200_iter_9_w2v.txt"
-        shutil.copy2(GENE2VEC_SRC, gene2vec_dst)
-        print(f"  Copied Gene2vec to: {gene2vec_dst}", flush=True)
+            with open(scgpt_vocab_path) as f:
+                vocab = json.load(f)
+            gene_vocab = {k: v for k, v in vocab.items() if k.strip() != ""}
+            id_to_gene = {int(v): k for k, v in gene_vocab.items()}
+
+            emb_key = None
+            with safe_open(scgpt_model_path, framework="pt", device="cpu") as f:
+                keys = list(f.keys())
+            for k in ["encoder.weight", "gene_encoder.embedding.weight", "transformer.wte.weight"]:
+                if k in keys:
+                    emb_key = k
+                    break
+            if emb_key is None:
+                emb_key = [k for k in keys if "embed" in k.lower() or "encoder" in k.lower()]
+                emb_key = emb_key[0] if emb_key else keys[0]
+
+            with safe_open(scgpt_model_path, framework="pt", device="cpu") as f:
+                emb_np = np.asarray(f.get_tensor(emb_key))
+            full_emb = {gene: emb_np[gid].astype(np.float32) for gid, gene in id_to_gene.items() if gid < emb_np.shape[0]}
+            scgpt_subset = {g: full_emb[g] for g in all_pert_genes if g in full_emb}
+            if len(scgpt_subset) >= 2:
+                joblib.dump(scgpt_subset, RESOURCES_DIR / "scgpt_embeddings.pkl")
+                print(f"  Extracted scGPT embeddings for {len(scgpt_subset)} genes -> scgpt_embeddings.pkl", flush=True)
+            else:
+                print(f"  Warning: Too few genes in scGPT vocab ({len(scgpt_subset)}), skipping scgpt_embeddings.pkl", flush=True)
+        except Exception as e:
+            print(f"  Warning: Failed to extract scGPT embeddings: {e}", flush=True)
+    else:
+        print(f"  Info: scGPT model not found, skipping scgpt_embeddings.pkl", flush=True)
+
+    # 提取 Gene2vec 子集（仅所需基因）为紧凑 pkl，避免加载大文件
+    all_pert_set = set(all_pert_genes)
+    if GENE2VEC_SRC.exists():
+        try:
+            g2v = {}
+            with open(GENE2VEC_SRC) as f:
+                first = f.readline().strip().split()
+                dim = int(first[1])
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < dim + 1:
+                        continue
+                    gene = parts[0]
+                    if gene in all_pert_set:
+                        g2v[gene] = np.array([float(x) for x in parts[1 : dim + 1]], dtype=np.float32)
+            if len(g2v) >= 2:
+                joblib.dump(g2v, RESOURCES_DIR / "gene2vec_embeddings.pkl")
+                print(f"  Extracted Gene2vec embeddings for {len(g2v)} genes -> gene2vec_embeddings.pkl", flush=True)
+            else:
+                print(f"  Warning: Too few genes in Gene2vec ({len(g2v)}), skipping gene2vec_embeddings.pkl", flush=True)
+        except Exception as e:
+            print(f"  Warning: Failed to extract Gene2vec: {e}", flush=True)
     else:
         print(f"  Warning: Gene2vec not found at {GENE2VEC_SRC}", flush=True)
 
@@ -466,9 +547,10 @@ def main():
         flush=True,
     )
 
+    method_name = "FlowXA_pc10_xpc20+GSE217812" if use_gse217812 else "FlowXA_pc10_xpc20"
     print("\n" + "=" * 80)
     print("Resources prepared successfully!")
-    print("Method: FlowXA_pc10_xpc20 (Pure Flow + xatlas)")
+    print(f"Method: {method_name} (Pure Flow + xatlas)")
     print("CV: Pearson=0.1767, CosineSim=0.5442")
     print("=" * 80, flush=True)
 

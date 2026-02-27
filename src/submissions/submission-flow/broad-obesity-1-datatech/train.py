@@ -95,37 +95,30 @@ def train(
     print(f"  pre_adipo: {avg_prop[0]:.4f}, adipo: {avg_prop[1]:.4f}")
     print(f"  lipo: {avg_prop[2]:.4f}, other: {avg_prop[3]:.4f}")
 
-    # 3. 拟合 Gene2vec KNN 细胞比例预测器
-    gene2vec_path = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
-    script_dir = Path(__file__).resolve().parent
-    if not os.path.exists(gene2vec_path):
-        # 本地开发时可能 Gene2vec 在 external_repos
-        fallback = script_dir.parent.parent.parent.parent / "external_repos" / "Gene2vec" / "pre_trained_emb" / "gene2vec_dim_200_iter_9_w2v.txt"
-        if fallback.exists():
-            gene2vec_path = str(fallback)
+    # 3. 拟合细胞比例 KNN 预测器（仅用 resources 中预提取的紧凑 pkl，不加载大文件）
+    scgpt_emb_path = os.path.join(model_directory_path, "scgpt_embeddings.pkl")
+    gene2vec_emb_path = os.path.join(model_directory_path, "gene2vec_embeddings.pkl")
 
-    if df_prop_train is not None and os.path.exists(gene2vec_path):
+    predictor = None
+    if df_prop_train is not None:
         df_prop_no_nc = df_prop_train[df_prop_train["gene"] != "NC"]
         train_genes = df_prop_no_nc["gene"].tolist()
-        if len(train_genes) >= 2:
-            predictor = ProportionKNNPredictor(k=15)
-            predictor.fit(train_genes, df_prop_train, gene2vec_path)
-            joblib.dump(predictor, os.path.join(model_directory_path, "proportion_knn_predictor.pkl"))
-            # 若使用 fallback 路径，复制 Gene2vec 到 model 目录供 infer 使用
-            dst_gene2vec = os.path.join(model_directory_path, "gene2vec_dim_200_iter_9_w2v.txt")
-            if gene2vec_path != dst_gene2vec:
-                import shutil
-
-                shutil.copy2(gene2vec_path, dst_gene2vec)
-                print(f"  Copied Gene2vec to {dst_gene2vec}")
-            print(f"\nFitted ProportionKNNPredictor (K=15) on {len(train_genes)} genes")
-        else:
+        if len(train_genes) < 2:
             print("\nWarning: Too few train genes for ProportionKNNPredictor, skipping")
-    else:
-        if df_prop_train is None:
-            print("\nWarning: program_proportion.csv not found, skipping ProportionKNNPredictor")
+        elif os.path.exists(scgpt_emb_path):
+            emb = joblib.load(scgpt_emb_path)
+            predictor = ProportionKNNPredictor(k=15, n_pca=32, embedding_source="scgpt")
+            predictor.fit(train_genes, df_prop_train, emb)
+            joblib.dump(predictor, os.path.join(model_directory_path, "proportion_knn_predictor.pkl"))
+            print(f"\nFitted ProportionKNNPredictor (scGPT, n_pca=32, k=15) on {len(train_genes)} genes")
+        elif os.path.exists(gene2vec_emb_path):
+            emb = joblib.load(gene2vec_emb_path)
+            predictor = ProportionKNNPredictor(k=20, n_pca=32, embedding_source="gene2vec")
+            predictor.fit(train_genes, df_prop_train, emb)
+            joblib.dump(predictor, os.path.join(model_directory_path, "proportion_knn_predictor.pkl"))
+            print(f"\nFitted ProportionKNNPredictor (Gene2vec, n_pca=32, k=20) on {len(train_genes)} genes")
         else:
-            print(f"\nWarning: Gene2vec not found at {gene2vec_path}, skipping ProportionKNNPredictor")
+            print("\nWarning: No scgpt_embeddings.pkl or gene2vec_embeddings.pkl in resources, skipping")
 
     # 4. 保存
     os.makedirs(model_directory_path, exist_ok=True)
