@@ -4,3 +4,8 @@ tmp/
 *.csv
 *.pkl
 *.h5ad
+*.npy
+*.zip
+tmp_resources_verify/
+# 大文件 - 超过 GitHub 50MB 限制
+**/gene2vec*.txt
